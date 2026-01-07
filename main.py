@@ -11,6 +11,13 @@
 # Simulate absorbtion more accurately
 # World creation and distruction
 
+### Block improvements
+# Water reflects or transmits depending on critical angle to surface
+# Clouds use Acerola smoke grenade tactics (or approximation)
+# Leaves are transparent and light reactive.
+# Grass and wood are sharper
+# Include noise in water and cloud textures
+
 ### Bugs
 # Lines in the water
 
@@ -19,9 +26,9 @@ import time
 import random
 import math as maths
 import octree
+from functools import partial
 
 count = 0
-
 
 
 
@@ -43,6 +50,34 @@ number_of_random_normalised_vectors = len(random_normalised_vectors)
 
 random_normal_vectors = 
 '''
+import numpy as np
+
+def generate_perlin_noise_2d(shape, res):
+    def f(t):
+        return 6*t**5 - 15*t**4 + 10*t**3
+
+    delta = (res[0] / shape[0], res[1] / shape[1])
+    d = (shape[0] // res[0], shape[1] // res[1])
+    grid = np.mgrid[0:res[0]:delta[0],0:res[1]:delta[1]].transpose(1, 2, 0) % 1
+    # Gradients
+    angles = 2*np.pi*np.random.rand(res[0]+1, res[1]+1)
+    gradients = np.dstack((np.cos(angles), np.sin(angles)))
+    g00 = gradients[0:-1,0:-1].repeat(d[0], 0).repeat(d[1], 1)
+    g10 = gradients[1:,0:-1].repeat(d[0], 0).repeat(d[1], 1)
+    g01 = gradients[0:-1,1:].repeat(d[0], 0).repeat(d[1], 1)
+    g11 = gradients[1:,1:].repeat(d[0], 0).repeat(d[1], 1)
+    # Ramps
+    n00 = np.sum(grid * g00, 2)
+    n10 = np.sum(np.dstack((grid[:,:,0]-1, grid[:,:,1])) * g10, 2)
+    n01 = np.sum(np.dstack((grid[:,:,0], grid[:,:,1]-1)) * g01, 2)
+    n11 = np.sum(np.dstack((grid[:,:,0]-1, grid[:,:,1]-1)) * g11, 2)
+    # Interpolation
+    t = f(grid)
+    n0 = n00*(1-t[:,:,0]) + t[:,:,0]*n10
+    n1 = n01*(1-t[:,:,0]) + t[:,:,0]*n11
+    return np.sqrt(2)*((1-t[:,:,1])*n0 + t[:,:,1]*n1)
+
+perlin_grid = generate_perlin_noise_2d([128,128], [32,32])
 
 random0to1 = [random.uniform(0, 1) for i in range(10**7)]
 randomNeg1to1 = [random.uniform(-1,1) for i in range(10**7)]
@@ -61,9 +96,6 @@ def get_random_normalised_vector():
 
 def get_random_normalised_vector_old():
     return [random.uniform(-1,1), random.uniform(-1,1), random.uniform(-1,1)]
-
-
-COLOUR_COUNT = 0
 
 def reflect_in_face(point, direction): # Reflects the direction along any voxel faces the point may be sitting on
     newDirection = []
@@ -157,17 +189,18 @@ sqrt3 = maths.sqrt(3)
 
 colour_functions = {
     "no_effect" : lambda in_colour, point, dir, rayLength : in_colour,
-    "colour" : lambda in_colour, point, dir, rayLength, colour : colour,
-    "blend" : lambda in_colour, point, dir, rayLength, colour, coefficient : blend(colour, in_colour, coefficient),
+    "colour" : lambda colour, in_colour, point, dir, rayLength : colour,
+    "blend" : lambda colour, coefficient, in_colour, point, dir, rayLength : blend(colour, in_colour, coefficient),
     "random" : lambda in_colour, point, dir, rayLength : (random.randint(0,255), random.randint(0,255), random.randint(0,255)),
-    "fog_blend": lambda in_colour, point, dir, rayLength, colour : blend(colour, in_colour, rayLength/sqrt3),
-    "texture": lambda in_colour, point, dir, rayLength, texture : get_pixel_from_texture(texture, point),
-    "blend_texture" : lambda in_colour, point, dir, rayLength, texture, coefficient : blend(get_pixel_from_texture(texture, point), in_colour, coefficient),
-    "light_responsive_colour" : lambda in_colour, point, dir, rayLength, colour : brightnessAdjustment(in_colour, colour),
-    "light_responsive_texture" : lambda in_colour, point, dir, rayLength, texture : brightnessAdjustment(in_colour, get_pixel_from_texture(texture, point))
+    "fog_blend": lambda colour, in_colour, point, dir, rayLength : blend(colour, in_colour, rayLength/sqrt3),
+    "texture": lambda texture, in_colour, point, dir, rayLength : get_pixel_from_texture(texture, point),
+    "blend_texture" : lambda texture, coefficient, in_colour, point, dir, rayLength : blend(get_pixel_from_texture(texture, point), in_colour, coefficient),
+    "light_responsive_colour" : lambda colour, in_colour, point, dir, rayLength : brightnessAdjustment(in_colour, colour),
+    "light_responsive_texture" : lambda texture, in_colour, point, dir, rayLength : brightnessAdjustment(in_colour, get_pixel_from_texture(texture, point)),
+    "perlin_noise" : lambda in_colour, point, dir, rayLength : [in_colour[i]*0.75+in_colour[i]*(0.25*perlin_grid[int((point[0]*16)%128)][int((point[2]*16)%128)]) for i in range(2)] + [in_colour[2]],
 }
 
-blocks = { # Name : [Direction_effect, Colour_effect, direction_arguments, colour_arguments]
+blocks = { # Name : [Direction_effect, Colour_effect, direction_arguments, colour_arguments
     "air" : ["no_effect", "no_effect", [], []],#[(150,150,255), 0.01]], # Blends the background into the sky
     "mirror" : ["specular_reflection", "blend", [], [(255,255,255), 0.1]], # Mirror
     "noise" : ["halt", "random", [], []], # Returns a block of noise
@@ -178,7 +211,7 @@ blocks = { # Name : [Direction_effect, Colour_effect, direction_arguments, colou
     "dirt" : ["halt", "texture", [], ["dirt"]], # Textured block
     "wood" : ["halt", "texture", [], ["wood"]], # Textured block
     "translucentLeaves" : ["no_effect", "blend_texture", [], ["leaf", 0.7]], # Translucent texture block
-    "water" : ["specular_reflection", "blend", [], [(0,0,255), 0.1]],#[(0,0,255), 0.1]]
+    "water" : ["specular_reflection", "perlin_noise", [], []],#[(0,0,255), 0.1]],
     "lightResponsiveRed" : ["diffuse_reflection", "light_responsive_colour", [], [(255,0,0)]],
     "lightResponsiveGrass" : ["diffuse_reflection", "light_responsive_texture", [], ["grass"]],
     "lightResponsiveWood" : ["diffuse_reflection", "light_responsive_texture", [], ["wood"]],
@@ -186,6 +219,25 @@ blocks = { # Name : [Direction_effect, Colour_effect, direction_arguments, colou
     #"Double reflector"
 }
 
+# create way to apply layers on top of each other to remove need for blend_texture etc.
+
+
+applied_blocks = {}
+for blockKey in blocks:
+    block = blocks[blockKey]
+    applied_blocks[blockKey] = [partial(direction_functions[block[0]], *block[2]), partial(colour_functions[block[1]], *block[3])]
+
+N = 10000
+blockKeys = []
+for i in range(N):
+    blockKeys.append(random.choice(list(blocks.keys())))
+
+st = time.perf_counter()
+for i in range(N):
+    block = applied_blocks[blockKeys[i]]
+    colour = block[1]((i,i,i), [0,0,0], [1,0,0], 1)
+et = time.perf_counter()
+print((et-st)/N)
 
 def sky(direction):
     if (direction[1]+0.25)**2 + (direction[0]-0.25)**2 < 0.0025: # 0.5**2
@@ -199,6 +251,7 @@ for i in range(1000):
 
 class World:
     def __init__(self):
+        self.static = True
         s = time.perf_counter()
         self.generate_world()
         e = time.perf_counter()
@@ -208,16 +261,25 @@ class World:
         self.octree = octree.Octree(self.voxel_array, 0, 0, 0, len(self.voxel_array))
         e = time.perf_counter()
         print("create octree", e-s)
+
+        s = time.perf_counter()
+        self.dynamic_blocks = []
+        for i in range(128):
+            for j in range(128):
+                for k in range(128):
+                    if self.is_block_dynamic((i,j,k)):
+                        self.dynamic_blocks.append((i,j,k))
         
         del self.voxel_array
     
     def generate_world(self):
+        WORLD_SIZE = 128
         self.voxel_array = []
-        for i in range(128):
+        for i in range(WORLD_SIZE):
             self.voxel_array.append([])
-            for j in range(128):
+            for j in range(WORLD_SIZE):
                 self.voxel_array[-1].append([])
-                for k in range(128):
+                for k in range(WORLD_SIZE):
                     
                     #colour = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
                     #condition = j > 32
@@ -229,22 +291,21 @@ class World:
                     #colour = random.choice(list(textureCoords.keys()))#"grass"
                     if j < 20:
                         #colour = "grass"
-                        colour = "lightResponsiveGrass"
+                        block = "lightResponsiveGrass"
                     elif j < 50:
-                        colour = "lightResponsiveDirt"
+                        block = "lightResponsiveDirt"
                     else:
-                        colour = "lightResponsiveStone"
+                        block = "lightResponsiveStone"
 
                     #colour = "grass"
 
                     if condition == 0 and j > 13:
                         condition = 1
-                        colour = "water"
+                        block = "water"
 
-                    self.voxel_array[-1][-1].append(colour if condition else "air")
+                    self.voxel_array[-1][-1].append(block if condition else "air")
                     #self.voxel_array[-1][-1].append((2*i, 2*j, 2*k) if j > 5+3*maths.sin(i+k) else 0)
                     #self.voxel_array[-1][-1].append((random.randint(0,255), random.randint(0,255), random.randint(0,255)) if j > 5 else 0)
-                    
 
                     #condition = (i == 12)
                     '''
@@ -257,9 +318,9 @@ class World:
                     '''
         print("Terrain Done")
         
-        for i in range(128):
-            x = random.randrange(0,128)
-            z = random.randrange(12,128)
+        for i in range(WORLD_SIZE*WORLD_SIZE//128):
+            x = random.randrange(0,WORLD_SIZE)
+            z = random.randrange(14,WORLD_SIZE)
             voxel = "air"
             y = -1
             while voxel == "air":
@@ -288,13 +349,12 @@ class World:
                             pass
         
 
-        for i in range(2048):
+        for i in range(WORLD_SIZE*WORLD_SIZE//8):
             v = 1
             while v != "air":
-                x = random.randrange(0, 128)
+                x = random.randrange(0, WORLD_SIZE)
                 y = random.randrange(0, 5)
-                z = random.randrange(0, 128)
-                #self.set_voxel(x,y,z,"mist")
+                z = random.randrange(0, WORLD_SIZE)
                 v = self.voxel_array[int(x)][int(y)][int(z)]
             self.voxel_array[int(x)][int(y)][int(z)] = "mist"
 
@@ -305,6 +365,29 @@ class World:
 
         self.voxel_array[9][5][20] = "whiteLight"
         
+    def is_block_dynamic(self, position):
+        block = self.get_voxel(*position)[0]
+        if block == "sand":
+            if self.get_voxel(position[0], position[1]+1, position[2])[0] in ["air", "sand"]:
+                return True
+            else:
+                return False
+        return False
+
+    def update_dynamics(self):
+        new_dynamic_blocks = []
+        for block_pos in self.dynamic_blocks:
+            block_type, tree = self.get_voxel(*block_pos)
+
+            if block_type == "mist":
+                new_block_pos = block_pos[0], block_pos[1]+1, block_pos[2]
+                self.set_voxel(*block_pos, "air")
+                self.set_voxel(*new_block_pos, "mist")
+
+                if self.is_block_dynamic(new_block_pos):
+                    new_dynamic_blocks.append([*new_block_pos])
+        self.dynamic_blocks = new_dynamic_blocks
+            
 
     def get_voxel(self, pointX, pointY, pointZ):
         current_tree = self.octree
@@ -357,24 +440,42 @@ class World:
         
         return voxel, current_tree
 
+    def set_voxel(self, pointX, pointY, pointZ, new_voxel):
+        voxel, tree = self.get_voxel(pointX, pointY, pointZ)
+        if voxel == new_voxel or voxel == -1:
+            return
+        self.static = False
+        while tree.size != 1:
+            tree.block = None
+            tree.create_children()
+            for child in tree.children:
+                child.block = voxel
+            #print([pointX, pointY, pointZ], [tree.x, tree.y, tree.z], tree.size)
+            index = 4*(pointX-tree.z)//(tree.size/2) + 2*(pointY-tree.y)//(tree.size/2) + 1*(pointZ-tree.x)//(tree.size/2)
+            #print(index)
+            tree = tree.children[int(index)]
+        
+        tree.block = new_voxel
+
 def cast_ray(start, rayDir, depth=1):
-    global COLOUR_COUNT
+    global LAMBDA_COUNT, GET_COUNT
     #global count
     #count += 1
 
     if depth > 200:
         return (255,255,0)
 
+    #GET_COUNT += 1
     voxelName, currentTree = world.get_voxel(*start)
-    voxel = blocks[voxelName]
+    voxel = applied_blocks[voxelName]
     
-    COLOUR_COUNT += 1
-    newRayDir = direction_functions[voxel[0]](start, rayDir, *voxel[2])
+    #LAMBDA_COUNT += 1
+    newRayDir = voxel[0](start, rayDir)
     #newRayDir = normalise(newRayDir)
 
     if newRayDir == [0,0,0]:
-        COLOUR_COUNT += 1
-        return colour_functions[voxel[1]](None, start, newRayDir, None, *voxel[3])
+        #LAMBDA_COUNT += 1
+        return voxel[1](None, start, newRayDir, None)
     
     size = currentTree.size
     
@@ -420,14 +521,69 @@ def cast_ray(start, rayDir, depth=1):
         return sky(newRayDir)
     
     in_colour = cast_ray(end, newRayDir, depth+1)
-    COLOUR_COUNT += 1
-    out_colour = colour_functions[voxel[1]](in_colour, start, newRayDir, DL, *voxel[3])
+    #LAMBDA_COUNT += 1
+    out_colour = voxel[1](in_colour, start, newRayDir, DL)
     return out_colour
-    #return colour_functions[voxel[1]](cast_ray(end, newRayDir, depth+1), start, newRayDir, DL, *voxel[3])
-      
+    #return voxel[1](cast_ray(end, newRayDir, depth+1), start, newRayDir, DL)
+
+def basic_cast(start, rayDir, depth=1):
+    if depth > 200:
+        return [-1,-1,-1]
+
+    voxelName, currentTree = world.get_voxel(*start)
+    voxel = applied_blocks[voxelName]
+    
+    if voxelName != "air":
+        return start
+    newRayDir = rayDir
+    
+    size = currentTree.size
+    
+    dl = 1000
+    if newRayDir[0] > 0:
+        temp = (size-start[0]%size)/newRayDir[0] + 0.000001
+        if dl > temp:
+            dl = temp #if temp != 0 else dl
+    elif newRayDir[0] < 0:
+        temp = -(start[0]%size)/newRayDir[0] + 0.000001
+        if dl > temp:
+            dl = temp #if temp != 0 else dl
+    
+
+    if newRayDir[1] > 0:
+        temp = (size-start[1]%size)/newRayDir[1] + 0.000001
+        if dl > temp:
+            dl = temp #if temp != 0 else dl
+    elif newRayDir[1] < 0:
+        temp = -(start[1]%size)/newRayDir[1] + 0.000001
+        if dl > temp:
+            dl = temp #if temp != 0 else dl
+        
+    if newRayDir[2] > 0:
+        temp = (size-start[2]%size)/newRayDir[2] + 0.000001
+        if dl > temp:
+            dl = temp #if temp != 0 else dl
+    elif newRayDir[2] < 0:
+        temp = -(start[2]%size)/newRayDir[2] + 0.000001
+        if dl > temp:
+            dl = temp #if temp != 0 else dl
+
+    end = [start[0], start[1], start[2]]
+    DL = 0
+    while int(start[0]) == int(end[0]) and int(start[1]) == int(end[1]) and int(start[2]) == int(end[2]):
+        end[0] += dl*newRayDir[0]
+        end[1] += dl*newRayDir[1]
+        end[2] += dl*newRayDir[2]
+        DL += dl
+        dl = 0.01
+
+    if not 0 <= end[0] < worldLength or not 0 <= end[1] < worldLength or not 0 <= end[2] < worldLength:
+        return [-1,-1,-1]
+    
+    end = basic_cast(end, newRayDir, depth+1)
+    return end
 
 if __name__ == "__main__":
-
     st = time.perf_counter()
     world = World()
 
@@ -445,10 +601,10 @@ if __name__ == "__main__":
 
     worldLength = world.octree.size
 
-    camPosX,camPosY,camPosZ = [10,10,10]
+    camPosX,camPosY,camPosZ = [64.5,5,64]
     #camDirX,camDirY,camDirZ = [0,0,1]
 
-    yaw = 0#maths.pi/2
+    yaw = maths.pi/4
 
     camDirX,camDirY,camDirZ = [maths.sin(yaw),0,maths.cos(yaw)]
 
@@ -460,8 +616,13 @@ if __name__ == "__main__":
 
     print("WORLD GENERATED", time.perf_counter() - st)
 
+    buffer = []
+
     while running:
         st = time.perf_counter()
+        
+        LAMBDA_COUNT = 0
+        GET_COUNT = 0
         for imageX in range(-effWIDTH//2, effWIDTH//2):
             for imageY in range(-effHEIGHT//2, effHEIGHT//2):
                 pointX = camPosX-camDirX
@@ -472,27 +633,62 @@ if __name__ == "__main__":
                 rayDirY = imageY/effHEIGHT + camDirY
                 rayDirZ = camDirZ - camDirX * imageX / effWIDTH
 
-                colour = cast_ray([pointX, pointY, pointZ], [rayDirX, rayDirY, rayDirZ])
+                if pointX < 0 or pointY < 0 or pointZ < 0:
+                    if pointX < 0:
+                        dl = -pointX/rayDirX + 0.001
+                    if pointY < 0:
+                        temp = -pointY/rayDirY + 0.001
+                        if dl > temp:
+                            dl = temp
+                    if pointZ < 0:
+                        temp = -pointZ/rayDirZ + 0.001
+                        if dl > temp:
+                            dl = temp
+                    pointX += dl * rayDirX
+                    pointY += dl * rayDirY
+                    pointZ += dl * rayDirZ
 
-                if iteration == 0:
-                    current_colour = colour
+                if pointX < 0 or pointY < 0 or pointZ < 0:
+                    colour = sky([rayDirX, rayDirY, rayDirZ])
                 else:
-                    current_colour = screen.get_at((RESOLUTION*(imageX+effWIDTH//2), RESOLUTION*(imageY+effHEIGHT//2)))
-                
-                averageColour = [(iteration*current_colour[i] + colour[i])/(iteration+1) for i in range(3)]
+                    colour = cast_ray([pointX, pointY, pointZ], [rayDirX, rayDirY, rayDirZ])
+
+
+                #add check to see if dynamic objects and camera motion
+                if world.static:
+                    if iteration == 0:
+                        current_colour = colour
+                    else:
+                        current_colour = screen.get_at((RESOLUTION*(imageX+effWIDTH//2), RESOLUTION*(imageY+effHEIGHT//2)))
+                    
+                    averageColour = [(iteration*current_colour[i] + colour[i])/(iteration+1) for i in range(3)]
+                else:
+                    averageColour = colour
 
                 #pygame.draw.rect(screen, colour, (RESOLUTION*(imageX+effWIDTH//2), RESOLUTION*(imageY+effHEIGHT//2), RESOLUTION, RESOLUTION))
                 screen.set_at((RESOLUTION*(imageX+effWIDTH//2), RESOLUTION*(imageY+effHEIGHT//2)), averageColour)
 
             pygame.draw.circle(screen, (50,50,50), (WIDTH//2, HEIGHT//2),5)
             pygame.display.update()
-        
+            
+
+            for event in pygame.event.get(): # Can convert loop back to one main loop when framerate increases
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    holdingDown = time.perf_counter()
+                elif event.type == pygame.MOUSEBUTTONUP:
+                    buffer.append(event)
+                    holdingDown = time.perf_counter() - holdingDown
+                else:
+                    buffer.append(event)
+        world.static = True
+        world.update_dynamics()
+
         et = time.perf_counter()
         print(et-st)
 
         vel = [0,0,0]
 
-        for event in pygame.event.get():
+        for event in buffer:
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_w:
                     vel[2] = 1
@@ -515,12 +711,13 @@ if __name__ == "__main__":
                 elif event.key == pygame.K_ESCAPE:
                     pygame.quit()
                     running = False
+                world.static = False
 
                 camPosZ += (camDirZ * vel[2] - camDirX * vel[0])*0.5
                 camPosY += vel[1]*0.5
                 camPosX += (camDirZ * vel[0] + camDirX * vel[2])*0.5
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                holdingDown = time.perf_counter()
+            #elif event.type == pygame.MOUSEBUTTONDOWN:
+            #    holdingDown = time.perf_counter()
 
             elif event.type == pygame.MOUSEBUTTONUP:
                 rayDirX = camDirX + camDirZ * 0 / effWIDTH
@@ -531,16 +728,23 @@ if __name__ == "__main__":
                 pointY = camPosY-camDirY
                 pointZ = camPosZ-camDirZ
 
-                #pointX, pointY, pointZ, voxel, flags = cast_ray(rayDirX, rayDirY, rayDirZ, pointX, pointY, pointZ, "")
+                point = basic_cast([pointX, pointY, pointZ], [rayDirX, rayDirY, rayDirZ])
+                pointX, pointY, pointZ = point
+
+                if point == [-1,-1,-1]:
+                    continue
 
                 #t = 2*int(time.perf_counter() - holdingDown)
-                #if t != 0:
-                #    for i in range(-t,t):
-                #        for j in range(-t,t):
-                #            for k in range(-t,t):
-                #                world.set_voxel(pointX+i, pointY+j, pointZ+k, 0 if "2" not in flags else "dirt")
-                #else:
-                #    world.set_voxel(pointX, pointY, pointZ, 0 if "2" not in flags else "dirt")
+                t = 2*int(holdingDown)
+                if t != 0:
+                    for i in range(-t,t):
+                        for j in range(-t,t):
+                            for k in range(-t,t):
+                                world.set_voxel(pointX+i, pointY+j, pointZ+k, "air")
+                else:
+                    world.set_voxel(pointX, pointY, pointZ, "air")
         iteration += 1
         #print(count)
-        print(COLOUR_COUNT)
+        print(GET_COUNT)
+        print(LAMBDA_COUNT)
+        buffer = []
